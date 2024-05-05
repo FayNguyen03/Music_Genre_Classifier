@@ -1,0 +1,468 @@
+---
+title: "Challenge II: SPOTIFY DATASET"
+author: "Khanh Tra Nguyen Tran"
+date: "11/02/2023"
+output:
+  pdf_document: 
+    default
+  html_document: default
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning=FALSE, message=FALSE, cache = TRUE)
+```
+
+```{r}
+library(dplyr)
+library(rsample)
+library(lubridate)
+library(tidyverse)
+library(tidymodels)
+tidymodels_prefer()
+library(glmnet)
+library(vip)
+library(rpart.plot)
+library(randomForest)
+library(caret)
+library(knitr)
+library(xgboost)
+library(usemodels)
+```
+
+# I. INTRODUCTION
+
+Nowadays, Spotify becomes one of the largest music streaming platforms in the world, emerging as a cultural phenomenon and captivating music enthusiasts worldwide with its vast library of songs and artists as well as user-friendly and attractive interface. In this era, where music consumption has become an integral part of daily life, Spotify are considered by many smart device users as an indispensable app that they utilize to access to an extensive collection of tracks spanning various genres and artists. While the platform excels in delivering personalized playlists and recommendations, an intriguing question arises for those users seeking to unravel the dynamics of music popularity. Some common questions are Is predicting a song's popularity solely contingent on the reputation of its artist or genre, or can we delve deeper into the intricacies of the song itself, such as the "meaningfulness" or "brightness" of the lyrics or the hidden formula for a viral song lays on the instrument? Acknowledging this, Spotify provides their analysis with the attributes of each song they have on the platform so the curious users can retrieve these precious data and conduct the research on their own.
+
+In this challenge, utilizing this powerful datasert, I will delve into the questions: Whether we can use the attributes of the songs to predict the genre of a track without considering any other genre-related attributes (artists who are famous with a specific genre, the main genre of the album this track belongs to,...).
+
+# II. APPROACH
+
+## 1. Dataset:
+
+**Wrangling the data:**
+
+In the raw dataset, we have more than 30,417 observational units and 23 variables. For the `track_album_release_date`, it initially has the type of <chr>, which is not really suitable to use with the date type, so I converted this type into <date> using ymd(). When I conducted this step, `track_album_release_date` has some rows with missing values. Therefore, I dropped all the row with missing values. Also, I wanted to specify the mode of each song instead of the number of 1s (major scale) and 0s (minor scale). Since the dataset is so big, I decided to only use the tracks released after 2015 to narrow down the dataset to about 18,000 rows and removed some redundant variables that may make the model work less efficiently. Finally, I converted the categorical variables (playlist_genre, mode) into <fct> type.
+
+```{r}
+bigspotify <- readr::read_csv('~/Mscs 341 F23/Submit/Challenge2/Spotify.csv')
+```
+
+```{r}
+spotify_cleaned <- 
+  bigspotify |>
+  mutate(track_album_release_date = ymd(track_album_release_date),
+         mode = ifelse(mode == 0, "minor", "major")) |>
+  drop_na(track_album_release_date) |>
+  filter(year(track_album_release_date) >= 2015) |>
+  select(- track_id, 
+         - track_album_id, 
+         - track_album_release_date, 
+         - track_name, 
+         - track_artist, 
+         - track_album_name, 
+         - playlist_name, 
+         - playlist_id, 
+         - playlist_subgenre,
+         - key,
+         - liveness) |>
+  mutate(playlist_genre = fct(playlist_genre),
+         mode = fct(mode))
+```
+
+**Important Variable Description**
+
+In the modified dataset *spotify_cleaned*, these are variables under consideration: `acousticness`, `danceability`, `playlist_genre`, `valence`, `tempo` , `speechiness`, `mode`, `loudness`, `instrumentalness`, `energy`, `duration_ms`, and `track_popularity`.
+
+[Variable Description Reference](https://www.kaggle.com/code/alankarmahajan/exploring-spotify-dataset#About-Database)
+
+The genres available in this dataset:
+
+```{r}
+table(spotify_cleaned$playlist_genre)
+```
+
+Distribution of genres:
+
+```{r, fig.width=4, fig.height=3}
+spotify_cleaned |>
+  group_by(playlist_genre) |> 
+  summarize(count = n()) |>
+  ggplot(aes(fct_reorder(playlist_genre,count, .desc = TRUE), count,fill = playlist_genre)) +
+  geom_bar(stat = "identity", show.legend = FALSE) +
+  labs(x = "Genre", y = "Count") +
+  theme_minimal() 
+```
+
+Pop is the genre which has the largest number of tracks while rap is the least one. The difference between these genres is not really significant for us to consider to lump the minority groups.
+
+## 2. Training and testing data sets:
+
+I set the seed to make sure that everytime I rerun this chunk of code, it will produce the same training and testing datasets. I chose to get 80% observations as training units and 20% observations as testing units since I assumed the more observations utilized for training the models, the more accurate the model is.
+
+```{r}
+# Split the dataset into 80% training and 20% testing
+set.seed(12120103)
+spotify_split <- initial_split(spotify_cleaned, prop = 4/5)
+spotify_train <- training(spotify_split)
+spotify_test <- testing(spotify_split)
+```
+
+# III. CLASSIFICATION MODELING
+
+I attempted to base on other variables to predict the genre of a track. I decided to use lasso classification, ridge classfication, random forest, and boosting.
+
+Since the recipe will remain the same for every modelling method, I have the recipe for this classification mission:
+
+## **Recipe**
+
+```{r, result = 'hide'}
+spotify_class_recipe <- recipe(playlist_genre ~ ., data = spotify_train) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_normalize(all_predictors())
+```
+
+For the cross-validation to optimize the parameters, I used 20-fold cross validation and penalty grid range from -10 to 10:
+
+```{r, result = 'hide'}
+spotify_fold <- vfold_cv(spotify_train, v = 20)
+penalty_grid <-
+  grid_regular(penalty(range = c(-10, 10)), levels = 10)
+```
+
+## **Lasso classification:**
+
+```{r, result = 'hide'}
+spotify_lasso_class_model <- 
+  multinom_reg(mixture = 1, penalty=tune()) |> 
+  set_mode("classification") |> 
+  set_engine("glmnet")
+
+spotify_lasso_class_wf <- workflow() |> 
+  add_recipe(spotify_class_recipe) |> 
+  add_model(spotify_lasso_class_model)
+
+tune_res <- tune_grid(
+  spotify_lasso_class_wf,
+  resamples = spotify_fold, 
+  grid = penalty_grid
+)
+
+
+(best_penalty <- select_best(tune_res, metric = "accuracy"))
+
+lasso_class_final_wf <- finalize_workflow(spotify_lasso_class_wf, best_penalty)
+final_spotify_lasso_class_fit <- fit(lasso_class_final_wf, data = spotify_train)
+```
+
+```{r, fig.width=6, fig.height=3}
+augment(final_spotify_lasso_class_fit, new_data = spotify_test) |>
+  accuracy(truth = playlist_genre, estimate = .pred_class) 
+
+cm <- augment(final_spotify_lasso_class_fit, new_data = spotify_test) |>
+  conf_mat(truth = playlist_genre, estimate = .pred_class)
+
+autoplot(cm, type = "heatmap")
+```
+
+```{r, fig.width=6, fig.height=3}
+extract_fit_parsnip(final_spotify_lasso_class_fit) %>%
+vip() +
+labs(title = "Lasso Variable Importance")
+```
+
+With this Lasso classification mode, the top five most important coefficients are `speechiness`, `danceability`, `energy`, `track_popularity`, and `duration_ms`.
+
+We have the accuracy of this model: 0.447. Therefore, it predicts correctly the genre for 44.6% or about 1,598 out of 3583 observations in the testing data set.
+
+The two genres got misclassified the most:
+
+a.  many **pop** tracks got misclassified as **latin** tracks:
+
+```{r,fig.width=3, fig.height=2}
+spotify_test |> 
+  filter(playlist_genre %in% c("latin", "pop")) |>
+  ggplot(aes(x = playlist_genre, 
+             y = energy, 
+             color = playlist_genre)) +
+  geom_boxplot() +
+  labs(x = "Genre", y = "Energy", color = "Genre")
+spotify_test |> 
+  filter(playlist_genre %in% c("latin", "pop")) |>
+  ggplot(aes(x = playlist_genre, 
+             y = track_popularity, 
+             color = playlist_genre)) +
+  geom_boxplot() +
+  labs(x = "Genre", y = "Track Popularity", color = "Genre")
+```
+
+The two genres have the similar ranges as well as distribution of `energy` and `track_popularity` (2 of 5 most important variables).
+
+b.  many **r&b** track got misclassified as **pop** tracks:
+
+```{r, fig.width=3, fig.height=2}
+spotify_test |> 
+  filter(playlist_genre %in% c("r&b", "pop")) |>
+  ggplot(aes(x = playlist_genre, 
+             y = duration_ms, 
+             color = playlist_genre)) +
+  geom_boxplot() +
+  labs(x = "Genre", y = "Duration(ms)", color = "Genre")
+spotify_test |> 
+  filter(playlist_genre %in% c("r&b", "pop")) |>
+  ggplot(aes(x = playlist_genre, 
+             y = track_popularity, 
+             color = playlist_genre)) +
+  geom_boxplot() +
+  labs(x = "Genre", y = "Track Popularity", color = "Genre")
+```
+
+The two genres have the similar ranges as well as distribution of `duration_ms` and `track_popularity` (2 of 5 most important variables).
+
+## **Ridge classification:**
+
+```{r, result = 'hide'}
+
+spotify_ridge_class_model <- 
+  multinom_reg(mixture = 0, penalty=tune()) |> 
+  set_mode("classification") |> 
+  set_engine("glmnet")
+
+spotify_ridge_class_wf <- workflow() |> 
+  add_recipe(spotify_class_recipe) |> 
+  add_model(spotify_ridge_class_model)
+
+tune_res <- tune_grid(
+  spotify_ridge_class_wf,
+  resamples = spotify_fold, 
+  grid = penalty_grid
+)
+
+show_best(tune_res, metric = "accuracy")
+
+(best_penalty <- select_best(tune_res, metric = "accuracy"))
+
+ridge_class_final_wf <- finalize_workflow(spotify_ridge_class_wf, best_penalty)
+final_spotify_ridge_class_fit <- fit(ridge_class_final_wf, data = spotify_train)
+```
+
+```{r, fig.width=6, fig.height=3}
+augment(final_spotify_ridge_class_fit, new_data = spotify_test) |>
+  accuracy(truth = playlist_genre, estimate = .pred_class) 
+
+cm <- augment(final_spotify_ridge_class_fit, new_data = spotify_test) |>
+  conf_mat(truth = playlist_genre, estimate = .pred_class)
+
+autoplot(cm, type = "heatmap")
+```
+
+```{r,fig.width=6, fig.height=3}
+extract_fit_parsnip(final_spotify_ridge_class_fit) |>
+  vip() +
+  labs(title = "Variable Importance of Ridge Classification Model")
+```
+
+With this Ridge classification mode, the top five most important coefficients are `speechiness`, `energy`, `track_popularity`, `instrumentalness`, and `danceability`.
+
+We have the accuracy of this model: 0.442. Therefore, it predicts correctly 44.2% or 1583 out of 3583 observations in the testing data set.
+
+The two genres got misclassified the most:
+
+a.  many **pop** tracks got misclassified as **latin** tracks
+
+According to the plots a in Lasso Classification, these two genres have similar distribution of `energy` and `track_popularity`.
+
+b.  many **r&b** track got misclassified as **pop** tracks
+
+```{r, fig.width=3, fig.height=2}
+spotify_test |> 
+  filter(playlist_genre %in% c("r&b", "pop")) |>
+  ggplot(aes(x = playlist_genre, 
+             y = instrumentalness, 
+             color = playlist_genre)) +
+  geom_boxplot() +
+  labs(x = "Genre", y = "Intrumentalness", color = "Genre")
+spotify_test |> 
+  filter(playlist_genre %in% c("r&b", "pop")) |>
+  ggplot(aes(x = playlist_genre, 
+             y = track_popularity, 
+             color = playlist_genre)) +
+  geom_boxplot() +
+  labs(x = "Genre", y = "Track Popularity", color = "Genre")
+```
+
+The two genres have the similar ranges as well as distribution of `instrumentalness` and `track_popularity` (2 of 5 most important variables).
+
+## **Random Forest:**
+
+Since this training data set has a really large amount of observational units, I decided to lower down the number of trees for this model down to 100 and only use 10-fold cross-validation. I tuned the min_n and mtry parameters to get the most efficient model.
+
+```{r,result='hide'}
+set.seed(2003)
+spotify_fold <- vfold_cv(spotify_train, v = 10)
+spotify_spec <-
+  rand_forest(tree = 100, min_n = tune(), mtry = tune()) |>
+  set_mode("classification") |>
+  set_engine("ranger", importance = "impurity")
+
+
+spotify_forest_wf <- workflow() |>
+  add_recipe(spotify_class_recipe) |>
+  add_model(spotify_spec)
+
+forest_grid <- grid_regular(min_n(), mtry(range = c(2,100)), levels = 4)
+
+spotify_forest_res <-
+  tune_grid(
+    spotify_forest_wf,
+    resamples = spotify_fold,
+    grid = forest_grid)
+
+(forest_best <- select_best(spotify_forest_res, metric = "accuracy"))
+
+forest_final_wf <- finalize_workflow(spotify_forest_wf, forest_best)
+
+forest_final_fit <- fit(forest_final_wf, spotify_train)
+```
+
+```{r, fig.width = 6, fig.height=3}
+augment(forest_final_fit, spotify_test) |>
+  accuracy(truth = playlist_genre, estimate = .pred_class)
+
+cm <- augment(forest_final_fit, spotify_test) |>
+  conf_mat(truth = playlist_genre, estimate = .pred_class)
+
+autoplot(cm, type = "heatmap")
+```
+
+We have the accuracy of this model: 0.515. Therefore, it predicts correctly 51.5% or 1680 out of 3304 observations in the testing data set.
+
+The variables that are most important in the dataset: `tempo`, `energy, speechiness`, `acousticness`, `danceability`.
+
+```{r, error= TRUE, fig.width=6, fig.height=3}
+extract_fit_parsnip(forest_final_fit) %>%
+vip() +
+labs(title = "Random Forest Variable Importance")
+```
+
+The two genres got misclassified the most:
+
+a.  Many **r&b** tracks got misclassified as **rap** and **pop** tracks.
+
+```{r,fig.width=3, fig.height=2}
+spotify_test |> 
+  filter(playlist_genre %in% c("r&b", "rap", "pop")) |>
+  ggplot(aes(x = playlist_genre, 
+             y = tempo, 
+             color = playlist_genre)) +
+  geom_boxplot() +
+  labs(x = "Genre", y = "Tempo", color = "Genre")
+```
+
+These three have kind of the same range and distribution for `tempo` (the most important variable).
+
+b.  Many **latin** tracks got misclassified as **pop** tracks.
+
+```{r,fig.width=3, fig.height=2}
+spotify_test |> 
+  filter(playlist_genre %in% c("latin", "pop")) |>
+  ggplot(aes(x = playlist_genre, 
+             y = energy, 
+             color = playlist_genre)) +
+  geom_boxplot() +
+  labs(x = "Genre", y = "Energy", color = "Genre")
+spotify_test |> 
+  filter(playlist_genre %in% c("latin", "pop")) |>
+  ggplot(aes(x = playlist_genre, 
+             y = acousticness, 
+             color = playlist_genre)) +
+  geom_boxplot() +
+  labs(x = "Genre", y = "Acousticness", color = "Genre")
+```
+
+Two genres have the same range of `energy` and `acousticness`. (2 of 5 most important variables)
+
+## **Boosting:**
+
+Since this training dataset has a large number of observations, I only used 10-fold cross validation and tuned tree numbers (ranging from 50 to 100 trees) and learning rate (from -3 to 0) of the model. I specify levels as 5.
+
+```{r,results='hide'}
+(spotify_xgboost_grid <- grid_regular(trees(range=c(50L,100L)), learn_rate(range=c(-3,0)), levels = 5))
+xgboost_recipe <- 
+  recipe(formula = playlist_genre ~ ., data = spotify_train) |> 
+  step_dummy(all_nominal_predictors()) |>
+  step_normalize(all_predictors())  |>
+  step_zv(all_predictors()) 
+
+xgboost_spec <- 
+  boost_tree(trees = tune(), learn_rate = tune()) |> 
+  set_mode("classification") |> 
+  set_engine("xgboost") 
+
+xgboost_workflow <- 
+  workflow() |> 
+  add_recipe(xgboost_recipe) |> 
+  add_model(xgboost_spec) 
+
+set.seed(24725)
+xgboost_tune <-
+  tune_grid(xgboost_workflow, 
+            resamples = spotify_fold, 
+            grid = spotify_xgboost_grid,
+            metrics = metric_set(accuracy))
+(best_param <- select_best(xgboost_tune, "accuracy"))
+(spotify_boost_wf <- finalize_workflow(xgboost_workflow, best_param))
+spotify_boost_model <- fit(spotify_boost_wf, spotify_train)
+```
+
+```{r, fig.width=4, fig.height=3}
+augment(spotify_boost_model, spotify_test) |>
+  accuracy(truth = playlist_genre, estimate = .pred_class)
+
+cm <- augment(spotify_boost_model, spotify_test) |>
+  conf_mat(truth = playlist_genre, estimate = .pred_class)
+
+autoplot(cm, type = "heatmap")
+```
+
+We have the accuracy of this model: 0.521. Therefore, it predicts correctly 52.1% or 1866 out of 3583 observations in the testing data set.
+
+The variables that are most important in the dataset: `tempo`, `energy`, `speechiness`, `acousticness`, and `danceability`.
+
+```{r, error= TRUE, fig.width=6, fig.height=3}
+extract_fit_parsnip(forest_final_fit) %>%
+vip() +
+labs(title = "Boosting Variable Importance")
+```
+
+The two genres got misclassified the most:
+
+a.  Many **r&b** tracks got misclassified as **rap** and **pop** tracks.
+
+According to the plot a in Random Forest, the range of variable `tempo` of these three genres are similar to others.
+
+b.  Many **latin** tracks got misclassified as **pop** tracks.
+
+According to the plots b in Random Forest, the range of two variables `acousticness` and `energy` of two genres are similar to others.
+
+# IV. CONCLUSION
+
+Among four classification models to classify the genre of the track, the Boosting works most efficiently, followed by the Lasso Regression and Ridge Regression.
+
+```{r}
+class_res <- data.frame(
+  Models = c("Boosting","Random Forest","Lasso", "Regression"),
+  Fold = c(10,10, 20, 20),
+  Accuracy = c(0.527, 0.515, 0.447, 0.442),
+  "Variables" = c("tempo, speechiness, energy, acousticness, danceability", "tempo, speechiness, danceability, energy, acousticness", "speechiness, energy, track_popularity, danceability, instrumentalness","speechiness,danceability,energy,track_popularity,duration_ms")
+)
+# Display the table using kable
+kable(class_res, caption = "Classification Result")
+```
+
+In conclusion, the observed limitations in achieving a high level of accuracy in the classification model can be attributed to several factors. Firstly, a notable challenge arises from the absence of discernible trends or specific patterns within the variables for each genre across the majority of predictors. While certain variables may be identified as more significant, their specificity within each genre remains insufficient, leading to an elevated risk of misclassification. Secondly, the classification task involves six distinct classes, further complicating the predictive task.
+
+Furthermore, the expansive size of the initial dataset, comprising approximately 19,000 observational units, introduces additional complexities. The voluminous nature of the data raises concerns about data quality, as the presence of outliers, missing values, noise, or errors may exert an unexpected influence on the models' accuracy. As a consequence, addressing these issues becomes imperative to enhance the robustness and reliability of the classification model.
+
+Though the accuracy is not high (\>80%), these models still can predict precisely a large amount of songs' genres in the testing dataset (about 1,500 observational units). For improvement, I think of processing the dataset again to remove the outliers in each variable, and employing robust cross-validation techniques to assess the model's performance across different subsets of the data.
